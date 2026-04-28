@@ -9,8 +9,9 @@ class DeltaEngine:
         self.deltas: Deque[float] = deque(maxlen=window)
 
     def update_trade(self, price: float, quantity: float, is_buyer_maker: bool) -> float:
-        direction = -1.0 if is_buyer_maker else 1.0
-        delta = direction * quantity * price
+        _ = price
+        is_buy = not is_buyer_maker
+        delta = quantity if is_buy else -quantity
         self.deltas.append(delta)
         return delta
 

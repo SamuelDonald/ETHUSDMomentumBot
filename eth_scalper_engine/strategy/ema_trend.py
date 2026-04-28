@@ -1,43 +1,37 @@
-from collections import deque
-from typing import Deque, Dict
+from typing import Dict
 
 
 class EmaTrendFilter:
-    def __init__(self, period: int = 20, slope_threshold: float = 0.03, weak_multiplier: float = 0.4):
+    def __init__(self, period: int = 20, slope_threshold: float = 0.03):
         self.period = period
         self.slope_threshold = slope_threshold
-        self.weak_threshold = slope_threshold * weak_multiplier
-        self.ema_values: Deque[float] = deque(maxlen=3)
         self.last_ema: float | None = None
+        self.previous_ema: float | None = None
 
-    def _ema(self, price: float) -> float:
+    def _ema(self, close_price: float) -> float:
         if self.last_ema is None:
-            self.last_ema = price
-            return price
+            self.last_ema = close_price
+            return close_price
         k = 2 / (self.period + 1)
-        self.last_ema = price * k + self.last_ema * (1 - k)
+        self.last_ema = close_price * k + self.last_ema * (1 - k)
         return self.last_ema
 
-    def update(self, close_price: float) -> Dict[str, float | str]:
-        ema = self._ema(close_price)
-        self.ema_values.append(ema)
+    def update(self, candle: dict) -> Dict[str, float | str]:
+        close_price = float(candle["c"])
+        ema_current = self._ema(close_price)
 
-        if len(self.ema_values) < 2:
+        if self.previous_ema is None:
+            self.previous_ema = ema_current
             return {"trend": "flat", "slope": 0.0}
 
-        slope = self.ema_values[-1] - self.ema_values[-2]
+        slope = ema_current - self.previous_ema
+        self.previous_ema = ema_current
+
         if slope > self.slope_threshold:
             trend = "bullish"
-        elif 0 < slope <= self.slope_threshold:
-            trend = "weak bullish"
         elif slope < -self.slope_threshold:
             trend = "bearish"
-        elif -self.slope_threshold <= slope < 0:
-            trend = "weak bearish"
         else:
-            trend = "flat"
-
-        if abs(slope) <= self.weak_threshold:
             trend = "flat"
 
         return {"trend": trend, "slope": slope}
