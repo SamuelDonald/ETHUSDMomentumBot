@@ -62,8 +62,9 @@ async def run_engine() -> None:
     latest_bos = None
     latest_swing_high = None
     latest_swing_low = None
-    latest_1m_close = None
-    latest_1m_close_time = 0
+    latest_1m_candle_id = 0
+    latest_bid_vol = 0.0
+    latest_ask_vol = 0.0
 
     logger.info("Starting ETHUSD scalper engine")
 
@@ -84,21 +85,23 @@ async def run_engine() -> None:
                     logger.warning("Order book data missing; skipping signal decision")
                     continue
 
-                bid_vol, ask_vol = imbalance_engine.update(latest_orderbook)
-                pressure_state = pressure_engine.evaluate(bid_volume=bid_vol, ask_volume=ask_vol)
+                pressure_state = pressure_engine.evaluate(
+                    bid_volume=latest_bid_vol,
+                    ask_volume=latest_ask_vol,
+                )
 
                 normalized_symbol = symbol_mapper.normalize_symbol(SETTINGS.symbols.canonical_symbol)
                 signal = signal_engine.generate(
                     symbol=SETTINGS.symbols.canonical_symbol,
                     normalized_symbol=normalized_symbol,
-                    entry_price=latest_1m_close if latest_1m_close is not None else price,
+                    entry_price=price,
                     pressure=pressure_state.state,
                     trend=latest_trend,
                     bos=latest_bos,
                     market_state=latest_market_state,
                     swing_high=latest_swing_high,
                     swing_low=latest_swing_low,
-                    signal_time=latest_1m_close_time,
+                    signal_candle_id=latest_1m_candle_id,
                 )
 
                 logger.info(
@@ -124,6 +127,7 @@ async def run_engine() -> None:
 
             elif "@depth" in stream_name:
                 latest_orderbook = parse_depth_message(data)
+                latest_bid_vol, latest_ask_vol = imbalance_engine.update(latest_orderbook)
 
             elif stream_name.endswith("@kline_5m"):
                 kline = data.get("k", {})
@@ -140,8 +144,8 @@ async def run_engine() -> None:
                     latest_bos = bos_result["bos"]
                     latest_swing_high = bos_result["swing_high"]
                     latest_swing_low = bos_result["swing_low"]
-                    latest_1m_close = float(kline["c"])
-                    latest_1m_close_time = int(float(kline.get("T", 0)) / 1000)
+                    latest_1m_candle_id = int(kline.get("t", 0))
+                    signal_engine.set_candle_id(latest_1m_candle_id)
                     logger.info(
                         "BOS update: %s swing_high=%s swing_low=%s | Market state: %s",
                         latest_bos,

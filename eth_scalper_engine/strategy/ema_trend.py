@@ -7,6 +7,7 @@ class EmaTrendFilter:
         self.slope_threshold = slope_threshold
         self.last_ema: float | None = None
         self.previous_ema: float | None = None
+        self.candle_count: int = 0
 
     def _ema(self, close_price: float) -> float:
         if self.last_ema is None:
@@ -19,6 +20,11 @@ class EmaTrendFilter:
     def update(self, candle: dict) -> Dict[str, float | str]:
         close_price = float(candle["c"])
         ema_current = self._ema(close_price)
+        self.candle_count += 1
+
+        if self.candle_count < self.period:
+            self.previous_ema = ema_current
+            return {"trend": "flat", "slope": 0.0}
 
         if self.previous_ema is None:
             self.previous_ema = ema_current

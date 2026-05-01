@@ -1,5 +1,4 @@
 import math
-import time
 from typing import Dict, Optional
 
 
@@ -8,8 +7,12 @@ class SignalEngine:
         self.rr = rr
         self.signal_cooldown = signal_cooldown
         self.max_signal_age = max_signal_age
-        self.last_signal_time: int = 0
+        self.last_signal_candle_id: int | None = None
         self.last_signal_type: str | None = None
+        self.current_candle_id: int | None = None
+
+    def set_candle_id(self, candle_id: int) -> None:
+        self.current_candle_id = candle_id
 
     def generate(
         self,
@@ -22,10 +25,9 @@ class SignalEngine:
         market_state: str,
         swing_high: float | None,
         swing_low: float | None,
-        signal_time: int,
+        signal_candle_id: int,
     ) -> Optional[Dict[str, object]]:
-        now = int(time.time())
-        if (now - signal_time) > self.max_signal_age:
+        if self.current_candle_id is None or self.current_candle_id != signal_candle_id:
             return None
 
         if not bos or market_state != "tradable":
@@ -38,7 +40,7 @@ class SignalEngine:
             return None
 
         signal = "BUY" if buy_ok else "SELL"
-        if self.last_signal_type == signal and (now - self.last_signal_time) < self.signal_cooldown:
+        if self.last_signal_type == signal and self.last_signal_candle_id == signal_candle_id:
             return None
 
         if signal == "BUY":
@@ -55,7 +57,7 @@ class SignalEngine:
         if not self._is_valid_signal(entry_price=entry_price, sl=sl, tp=tp, signal=signal):
             return None
 
-        self.last_signal_time = now
+        self.last_signal_candle_id = signal_candle_id
         self.last_signal_type = signal
 
         return {
@@ -70,7 +72,7 @@ class SignalEngine:
             "trend": trend,
             "bos": bos,
             "market_state": market_state,
-            "timestamp": now,
+            "timestamp": signal_candle_id,
         }
 
     def _is_valid_signal(self, entry_price: float, sl: float, tp: float, signal: str) -> bool:

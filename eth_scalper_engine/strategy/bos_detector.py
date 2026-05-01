@@ -32,8 +32,10 @@ class BOSDetector:
 
         if self.last_swing_high is not None and close_price > self.last_swing_high:
             bos_state = "bullish"
+            self.last_swing_high = None
         elif self.last_swing_low is not None and close_price < self.last_swing_low:
             bos_state = "bearish"
+            self.last_swing_low = None
 
         return {
             "bos": bos_state,
