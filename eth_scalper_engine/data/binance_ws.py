@@ -9,16 +9,14 @@ class BinanceWebSocketClient:
     def __init__(self, ws_base_url: str, symbol: str, depth_levels: int = 20):
         self.symbol = symbol.lower()
         self.depth_levels = depth_levels
-        # FIX: Use @depth<N> (full snapshot every 1000ms) instead of
-        # @depth<N>@100ms (diff stream requiring local order book maintenance).
-        # The diff stream sends only CHANGED levels — if no change occurred,
-        # bids/asks arrays are empty, causing "Order book data missing" on every
-        # trade tick until a meaningful update arrives.
-        # Full snapshot stream always contains the top N levels — no state management needed.
+        # Partial Book Depth stream: @depth<levels>@1000ms
+        # Sends a FULL snapshot every 1000ms — no local state management needed
+        # Payload keys: "bids" and "asks" (NOT "b"/"a" which is the diff stream)
+        # Valid levels: 5, 10, 20
         self.url = (
             f"{ws_base_url}?streams="
             f"{self.symbol}@trade/"
-            f"{self.symbol}@depth{depth_levels}/"   # full snapshot, ~1s refresh
+            f"{self.symbol}@depth{depth_levels}@1000ms/"
             f"{self.symbol}@kline_1m/"
             f"{self.symbol}@kline_5m"
         )
