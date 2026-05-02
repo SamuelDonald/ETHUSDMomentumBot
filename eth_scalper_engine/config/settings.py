@@ -28,7 +28,8 @@ class StrategySettings:
 
 @dataclass(frozen=True)
 class BridgeSettings:
-    zmq_endpoint: str = "tcp://127.0.0.1:5557"
+    # Changed from 5557 to 5558 to avoid system port conflicts
+    zmq_endpoint: str = "tcp://127.0.0.1:5558"
     high_water_mark: int = 1000
 
 
