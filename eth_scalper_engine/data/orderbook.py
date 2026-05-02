@@ -30,11 +30,19 @@ def _parse_levels(levels: Iterable[Iterable[str]]) -> List[Tuple[float, float]]:
             continue
         price = float(level[0])
         qty = float(level[1])
-        parsed.append((price, qty))
+        if qty > 0:   # skip zero-quantity levels (deletions in diff stream)
+            parsed.append((price, qty))
     return parsed
 
 
 def parse_depth_message(data: dict) -> OrderBookSnapshot:
-    bids = _parse_levels(data.get("b", []))
-    asks = _parse_levels(data.get("a", []))
-    return OrderBookSnapshot(bids=bids, asks=asks, event_time=int(data.get("E", 0)))
+    # Partial book depth snapshot (@depth<N>@1000ms) uses "bids"/"asks"
+    # Diff depth stream (@depth or @depth@100ms) uses "b"/"a"
+    # Support both formats so the parser works regardless of stream type
+    bids = _parse_levels(data.get("bids") or data.get("b", []))
+    asks = _parse_levels(data.get("asks") or data.get("a", []))
+    return OrderBookSnapshot(
+        bids=bids,
+        asks=asks,
+        event_time=int(data.get("T") or data.get("E") or 0),
+    )
