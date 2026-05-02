@@ -81,9 +81,14 @@ async def run_engine() -> None:
 
                 delta_engine.update_trade(price=price, quantity=qty, is_buyer_maker=is_buyer_maker)
 
-                if not latest_orderbook.bids or not latest_orderbook.asks:
+               # AFTER — only warn once every 10 seconds, not on every trade tick
+            if not latest_orderbook.bids or not latest_orderbook.asks:
+             import time
+                now = time.time()
+                if not hasattr(run_engine, '_last_ob_warn') or now - run_engine._last_ob_warn > 10:
                     logger.warning("Order book data missing; skipping signal decision")
-                    continue
+                    run_engine._last_ob_warn = now
+                continue
 
                 pressure_state = pressure_engine.evaluate(
                     bid_volume=latest_bid_vol,
