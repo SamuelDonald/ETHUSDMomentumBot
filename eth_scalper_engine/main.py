@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from eth_scalper_engine.bridge.zmq_sender import ZMQSignalSender
 from eth_scalper_engine.config.settings import SETTINGS
@@ -65,6 +66,7 @@ async def run_engine() -> None:
     latest_1m_candle_id = 0
     latest_bid_vol = 0.0
     latest_ask_vol = 0.0
+    last_ob_warn_time = 0.0   # throttle the order book warning to once per 10s
 
     logger.info("Starting ETHUSD scalper engine")
 
@@ -81,9 +83,12 @@ async def run_engine() -> None:
 
                 delta_engine.update_trade(price=price, quantity=qty, is_buyer_maker=is_buyer_maker)
 
-          if not latest_orderbook.bids or not latest_orderbook.asks:
-    logger.warning("Order book data missing; skipping signal decision")
-    continue
+                if not latest_orderbook.bids or not latest_orderbook.asks:
+                    now = time.monotonic()
+                    if now - last_ob_warn_time > 10.0:
+                        logger.warning("Order book data missing; skipping signal decision")
+                        last_ob_warn_time = now
+                    continue
 
                 pressure_state = pressure_engine.evaluate(
                     bid_volume=latest_bid_vol,
