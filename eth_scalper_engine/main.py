@@ -135,6 +135,15 @@ async def run_engine() -> None:
                     latest_trend, latest_bos, latest_market_state, last_price,
                 )
 
+                # Push live state to HTTP server so EA panel updates between signals
+                sender.update_state(
+                    pressure=pressure_state.state,
+                    trend=latest_trend,
+                    bos=latest_bos,
+                    market=latest_market_state,
+                    price=last_price,
+                )
+
                 if signal:
                     sent = sender.send(signal)
                     logger.info("Signal %s sent=%s", signal.get("signal"), sent)
