@@ -1,5 +1,4 @@
 import asyncio
-import time
 
 from eth_scalper_engine.bridge.zmq_sender import ZMQSignalSender
 from eth_scalper_engine.config.settings import SETTINGS
@@ -73,36 +72,40 @@ async def run_engine() -> None:
             if not topic or data is None:
                 continue
 
+            # ── ORDER BOOK ───────────────────────────────────────────────────
+            # Processed first in each poll cycle (bybit_ws yields ob before trades)
+            if topic.startswith("orderbook."):
+                latest_orderbook               = parse_depth_message(data)
+                latest_bid_vol, latest_ask_vol = imbalance_engine.update(latest_orderbook)
+
             # ── TRADES ──────────────────────────────────────────────────────
-            # Bybit REST recent-trade list (newest first):
-            # each item: [time, side, size, price, tickDirection, id, isBlockTrade]
-            # index:       0     1     2     3
-            if topic.startswith("publicTrade."):
+            # Bybit REST recent-trade: list of dicts
+            # { execId, symbol, price, size, side, time, isBlockTrade }
+            elif topic.startswith("publicTrade."):
+                if not latest_orderbook.bids or not latest_orderbook.asks:
+                    continue
+
                 trades = data if isinstance(data, list) else [data]
                 last_price = None
+
                 for trade in trades:
-                    if isinstance(trade, list):
-                        # REST format: [timestamp, side, size, price, ...]
-                        side  = str(trade[1])   # "Buy" or "Sell"
-                        qty   = float(trade[2])
-                        price = float(trade[3])
-                    else:
-                        # WebSocket format (fallback)
-                        side  = str(trade.get("S", "Buy"))
-                        qty   = float(trade.get("v", 0))
-                        price = float(trade.get("p", 0))
+                    # REST format: dict with named keys
+                    price = float(trade.get("price", 0))
+                    qty   = float(trade.get("size",  0))
+                    side  = str(trade.get("side", "Buy"))   # "Buy" or "Sell"
 
                     if price <= 0 or qty <= 0:
                         continue
 
-                    # "Buy" = aggressor bought = taker buy = is_buyer_maker False
+                    # side="Buy"  → aggressor is buyer  → is_buyer_maker=False
+                    # side="Sell" → aggressor is seller → is_buyer_maker=True
                     is_buyer_maker = (side == "Sell")
                     delta_engine.update_trade(
                         price=price, quantity=qty, is_buyer_maker=is_buyer_maker
                     )
                     last_price = price
 
-                if last_price is None or not latest_orderbook.bids or not latest_orderbook.asks:
+                if last_price is None:
                     continue
 
                 pressure_state    = pressure_engine.evaluate(
@@ -136,25 +139,15 @@ async def run_engine() -> None:
                     sent = sender.send(signal)
                     logger.info("Signal %s sent=%s", signal.get("signal"), sent)
 
-            # ── ORDER BOOK ───────────────────────────────────────────────────
-            elif topic.startswith("orderbook."):
-                msg_type         = payload.get("type", "snapshot")
-                latest_orderbook = parse_depth_message(data, msg_type)
-                latest_bid_vol, latest_ask_vol = imbalance_engine.update(latest_orderbook)
-
             # ── 5M KLINE ─────────────────────────────────────────────────────
             elif topic.startswith("kline.5."):
                 candles = data if isinstance(data, list) else [data]
                 for candle in candles:
                     if candle.get("confirm"):
                         kline = {
-                            "o": candle["open"],
-                            "c": candle["close"],
-                            "h": candle["high"],
-                            "l": candle["low"],
-                            "v": candle["volume"],
-                            "t": candle["start"],
-                            "x": True,
+                            "o": candle["open"],  "c": candle["close"],
+                            "h": candle["high"],  "l": candle["low"],
+                            "v": candle["volume"],"t": candle["start"], "x": True,
                         }
                         result       = trend_filter.update(kline)
                         latest_trend = str(result["trend"])
@@ -166,13 +159,9 @@ async def run_engine() -> None:
                 for candle in candles:
                     if candle.get("confirm"):
                         kline = {
-                            "o": candle["open"],
-                            "c": candle["close"],
-                            "h": candle["high"],
-                            "l": candle["low"],
-                            "v": candle["volume"],
-                            "t": candle["start"],
-                            "x": True,
+                            "o": candle["open"],  "c": candle["close"],
+                            "h": candle["high"],  "l": candle["low"],
+                            "v": candle["volume"],"t": candle["start"], "x": True,
                         }
                         latest_market_state = consolidation_filter.update(kline)["state"]
                         bos_result          = bos_detector.update(kline)
