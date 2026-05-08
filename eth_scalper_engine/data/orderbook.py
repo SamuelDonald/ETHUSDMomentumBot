@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 
 @dataclass
@@ -23,26 +23,45 @@ class OrderBookSnapshot:
         return self.best_bid or self.best_ask
 
 
-def _parse_levels(levels: Iterable[Iterable[str]]) -> List[Tuple[float, float]]:
-    parsed = []
-    for level in levels:
-        if len(level) < 2:
-            continue
-        price = float(level[0])
-        qty = float(level[1])
-        if qty > 0:   # skip zero-quantity levels (deletions in diff stream)
-            parsed.append((price, qty))
-    return parsed
+class BybitOrderBook:
+    def __init__(self):
+        self._bids: Dict[float, float] = {}
+        self._asks: Dict[float, float] = {}
+        self.event_time: int = 0
+
+    def update(self, data: dict, msg_type: str) -> "OrderBookSnapshot":
+        raw_bids = data.get("b", [])
+        raw_asks = data.get("a", [])
+
+        if msg_type == "snapshot":
+            self._bids = {float(p): float(q) for p, q in raw_bids if float(q) > 0}
+            self._asks = {float(p): float(q) for p, q in raw_asks if float(q) > 0}
+        else:
+            for price, qty in raw_bids:
+                p, q = float(price), float(qty)
+                if q == 0:
+                    self._bids.pop(p, None)
+                else:
+                    self._bids[p] = q
+            for price, qty in raw_asks:
+                p, q = float(price), float(qty)
+                if q == 0:
+                    self._asks.pop(p, None)
+                else:
+                    self._asks[p] = q
+
+        self.event_time = int(data.get("ts", 0))
+        sorted_bids = sorted(self._bids.items(), key=lambda x: -x[0])
+        sorted_asks = sorted(self._asks.items(), key=lambda x:  x[0])
+        return OrderBookSnapshot(
+            bids=[(p, q) for p, q in sorted_bids],
+            asks=[(p, q) for p, q in sorted_asks],
+            event_time=self.event_time,
+        )
 
 
-def parse_depth_message(data: dict) -> OrderBookSnapshot:
-    # Partial book depth snapshot (@depth<N>@1000ms) uses "bids"/"asks"
-    # Diff depth stream (@depth or @depth@100ms) uses "b"/"a"
-    # Support both formats so the parser works regardless of stream type
-    bids = _parse_levels(data.get("bids") or data.get("b", []))
-    asks = _parse_levels(data.get("asks") or data.get("a", []))
-    return OrderBookSnapshot(
-        bids=bids,
-        asks=asks,
-        event_time=int(data.get("T") or data.get("E") or 0),
-    )
+_bybit_ob = BybitOrderBook()
+
+
+def parse_depth_message(data: dict, msg_type: str = "snapshot") -> OrderBookSnapshot:
+    return _bybit_ob.update(data, msg_type)
