@@ -24,15 +24,14 @@ async def run_engine() -> None:
         broker_symbol_map=SETTINGS.symbols.broker_symbol_map,
     )
 
-    # Bybit WebSocket client — replaces Binance
     ws_client = BybitWebSocketClient(
         symbol=SETTINGS.bybit.symbol,
         depth_levels=SETTINGS.bybit.depth_levels,
     )
 
-    delta_engine        = DeltaEngine(window=SETTINGS.strategy.delta_window)
-    imbalance_engine    = OrderBookImbalanceEngine(window=SETTINGS.strategy.imbalance_window)
-    pressure_engine     = PressureEngine(
+    delta_engine         = DeltaEngine(window=SETTINGS.strategy.delta_window)
+    imbalance_engine     = OrderBookImbalanceEngine(window=SETTINGS.strategy.imbalance_window)
+    pressure_engine      = PressureEngine(
         delta_engine=delta_engine,
         imbalance_engine=imbalance_engine,
         epsilon=SETTINGS.strategy.pressure_epsilon,
@@ -65,9 +64,8 @@ async def run_engine() -> None:
     latest_1m_candle_id = 0
     latest_bid_vol      = 0.0
     latest_ask_vol      = 0.0
-    last_ob_warn_time   = 0.0
 
-    logger.info("Starting ETHUSD scalper engine (Bybit data source)")
+    logger.info("Starting ETHUSD scalper engine (Bybit REST polling)")
 
     try:
         async for payload in ws_client.stream():
@@ -76,26 +74,35 @@ async def run_engine() -> None:
                 continue
 
             # ── TRADES ──────────────────────────────────────────────────────
-            # Bybit: topic="publicTrade.ETHUSDT"
-            # data = list of trade dicts: {T, s, S, v, p, L, i, BT}
-            #   p = price, v = qty, S = "Buy" or "Sell"
+            # Bybit REST recent-trade list (newest first):
+            # each item: [time, side, size, price, tickDirection, id, isBlockTrade]
+            # index:       0     1     2     3
             if topic.startswith("publicTrade."):
                 trades = data if isinstance(data, list) else [data]
+                last_price = None
                 for trade in trades:
-                    price = float(trade["p"])
-                    qty   = float(trade["v"])
-                    # Bybit S="Buy" means aggressor bought (taker buy)
-                    # equivalent to Binance is_buyer_maker=False
-                    is_buyer_maker = (trade["S"] == "Sell")
+                    if isinstance(trade, list):
+                        # REST format: [timestamp, side, size, price, ...]
+                        side  = str(trade[1])   # "Buy" or "Sell"
+                        qty   = float(trade[2])
+                        price = float(trade[3])
+                    else:
+                        # WebSocket format (fallback)
+                        side  = str(trade.get("S", "Buy"))
+                        qty   = float(trade.get("v", 0))
+                        price = float(trade.get("p", 0))
+
+                    if price <= 0 or qty <= 0:
+                        continue
+
+                    # "Buy" = aggressor bought = taker buy = is_buyer_maker False
+                    is_buyer_maker = (side == "Sell")
                     delta_engine.update_trade(
                         price=price, quantity=qty, is_buyer_maker=is_buyer_maker
                     )
+                    last_price = price
 
-                if not latest_orderbook.bids or not latest_orderbook.asks:
-                    now = time.monotonic()
-                    if now - last_ob_warn_time > 10.0:
-                        logger.warning("Order book warming up...")
-                        last_ob_warn_time = now
+                if last_price is None or not latest_orderbook.bids or not latest_orderbook.asks:
                     continue
 
                 pressure_state    = pressure_engine.evaluate(
@@ -108,7 +115,7 @@ async def run_engine() -> None:
                 signal = signal_engine.generate(
                     symbol=SETTINGS.symbols.canonical_symbol,
                     normalized_symbol=normalized_symbol,
-                    entry_price=price,
+                    entry_price=last_price,
                     pressure=pressure_state.state,
                     trend=latest_trend,
                     bos=latest_bos,
@@ -119,10 +126,10 @@ async def run_engine() -> None:
                 )
 
                 logger.info(
-                    "pressure=%s delta=%.2f bid=%.2f ask=%.2f trend=%s bos=%s market=%s",
+                    "pressure=%s delta=%.2f bid=%.2f ask=%.2f trend=%s bos=%s market=%s price=%.2f",
                     pressure_state.state, pressure_state.delta,
                     pressure_state.bid_volume, pressure_state.ask_volume,
-                    latest_trend, latest_bos, latest_market_state,
+                    latest_trend, latest_bos, latest_market_state, last_price,
                 )
 
                 if signal:
@@ -130,23 +137,16 @@ async def run_engine() -> None:
                     logger.info("Signal %s sent=%s", signal.get("signal"), sent)
 
             # ── ORDER BOOK ───────────────────────────────────────────────────
-            # Bybit: topic="orderbook.20.ETHUSDT"
-            # type="snapshot" → full book, type="delta" → incremental update
             elif topic.startswith("orderbook."):
                 msg_type         = payload.get("type", "snapshot")
                 latest_orderbook = parse_depth_message(data, msg_type)
                 latest_bid_vol, latest_ask_vol = imbalance_engine.update(latest_orderbook)
 
-            # ── 5M KLINE (trend) ─────────────────────────────────────────────
-            # Bybit: topic="kline.5.ETHUSDT"
-            # data = list of kline dicts: {start, end, interval, open, close,
-            #                              high, low, volume, confirm, timestamp}
-            # confirm=True means candle is closed
+            # ── 5M KLINE ─────────────────────────────────────────────────────
             elif topic.startswith("kline.5."):
                 candles = data if isinstance(data, list) else [data]
                 for candle in candles:
                     if candle.get("confirm"):
-                        # Reformat to match EmaTrendFilter expected keys
                         kline = {
                             "o": candle["open"],
                             "c": candle["close"],
@@ -160,7 +160,7 @@ async def run_engine() -> None:
                         latest_trend = str(result["trend"])
                         logger.info("Trend: %s slope=%.5f", latest_trend, result["slope"])
 
-            # ── 1M KLINE (BOS + consolidation) ───────────────────────────────
+            # ── 1M KLINE ─────────────────────────────────────────────────────
             elif topic.startswith("kline.1."):
                 candles = data if isinstance(data, list) else [data]
                 for candle in candles:
@@ -186,8 +186,6 @@ async def run_engine() -> None:
                             latest_bos, latest_swing_high,
                             latest_swing_low, latest_market_state,
                         )
-
-            await asyncio.sleep(SETTINGS.loop_sleep_seconds)
 
     finally:
         sender.close()
