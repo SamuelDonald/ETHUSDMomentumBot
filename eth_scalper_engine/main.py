@@ -1,12 +1,12 @@
 import asyncio
 import time
 
-from eth_scalper_engine.bridge.signal_server import HTTPSignalSender
+from eth_scalper_engine.bridge.zmq_sender import ZMQSignalSender
 from eth_scalper_engine.config.settings import SETTINGS
 from eth_scalper_engine.core.delta_engine import DeltaEngine
 from eth_scalper_engine.core.orderbook_imbalance import OrderBookImbalanceEngine
 from eth_scalper_engine.core.pressure_engine import PressureEngine
-from eth_scalper_engine.data.binance_ws import BinanceWebSocketClient
+from eth_scalper_engine.data.bybit_ws import BybitWebSocketClient
 from eth_scalper_engine.data.orderbook import OrderBookSnapshot, parse_depth_message
 from eth_scalper_engine.strategy.bos_detector import BOSDetector
 from eth_scalper_engine.strategy.consolidation import ConsolidationFilter
@@ -23,11 +23,13 @@ async def run_engine() -> None:
         canonical_symbol=SETTINGS.symbols.canonical_symbol,
         broker_symbol_map=SETTINGS.symbols.broker_symbol_map,
     )
-    ws_client = BinanceWebSocketClient(
-        ws_base_url=SETTINGS.binance.ws_base_url,
-        symbol=SETTINGS.binance.symbol,
-        depth_levels=SETTINGS.binance.depth_levels,
+
+    # Bybit WebSocket client — replaces Binance
+    ws_client = BybitWebSocketClient(
+        symbol=SETTINGS.bybit.symbol,
+        depth_levels=SETTINGS.bybit.depth_levels,
     )
+
     delta_engine        = DeltaEngine(window=SETTINGS.strategy.delta_window)
     imbalance_engine    = OrderBookImbalanceEngine(window=SETTINGS.strategy.imbalance_window)
     pressure_engine     = PressureEngine(
@@ -49,9 +51,9 @@ async def run_engine() -> None:
         signal_cooldown=SETTINGS.strategy.signal_cooldown,
         max_signal_age=SETTINGS.strategy.max_signal_age,
     )
-    sender = HTTPSignalSender(
-        host=SETTINGS.bridge.http_host,
-        port=SETTINGS.bridge.http_port,
+    sender = ZMQSignalSender(
+        endpoint=SETTINGS.bridge.zmq_endpoint,
+        high_water_mark=SETTINGS.bridge.high_water_mark,
     )
 
     latest_orderbook    = OrderBookSnapshot()
@@ -65,24 +67,34 @@ async def run_engine() -> None:
     latest_ask_vol      = 0.0
     last_ob_warn_time   = 0.0
 
-    logger.info("Starting ETHUSD scalper engine (HTTP bridge on port %d)", SETTINGS.bridge.http_port)
+    logger.info("Starting ETHUSD scalper engine (Bybit data source)")
 
     try:
         async for payload in ws_client.stream():
-            stream_name, data = ws_client.get_stream_and_data(payload)
-            if not stream_name or not data:
+            topic, data = ws_client.get_stream_and_data(payload)
+            if not topic or data is None:
                 continue
 
-            if stream_name.endswith("@trade"):
-                price          = float(data["p"])
-                qty            = float(data["q"])
-                is_buyer_maker = bool(data["m"])
-                delta_engine.update_trade(price=price, quantity=qty, is_buyer_maker=is_buyer_maker)
+            # ── TRADES ──────────────────────────────────────────────────────
+            # Bybit: topic="publicTrade.ETHUSDT"
+            # data = list of trade dicts: {T, s, S, v, p, L, i, BT}
+            #   p = price, v = qty, S = "Buy" or "Sell"
+            if topic.startswith("publicTrade."):
+                trades = data if isinstance(data, list) else [data]
+                for trade in trades:
+                    price = float(trade["p"])
+                    qty   = float(trade["v"])
+                    # Bybit S="Buy" means aggressor bought (taker buy)
+                    # equivalent to Binance is_buyer_maker=False
+                    is_buyer_maker = (trade["S"] == "Sell")
+                    delta_engine.update_trade(
+                        price=price, quantity=qty, is_buyer_maker=is_buyer_maker
+                    )
 
                 if not latest_orderbook.bids or not latest_orderbook.asks:
                     now = time.monotonic()
                     if now - last_ob_warn_time > 10.0:
-                        logger.warning("Order book data missing; skipping signal decision")
+                        logger.warning("Order book warming up...")
                         last_ob_warn_time = now
                     continue
 
@@ -90,8 +102,10 @@ async def run_engine() -> None:
                     bid_volume=latest_bid_vol,
                     ask_volume=latest_ask_vol,
                 )
-                normalized_symbol = symbol_mapper.normalize_symbol(SETTINGS.symbols.canonical_symbol)
-                signal            = signal_engine.generate(
+                normalized_symbol = symbol_mapper.normalize_symbol(
+                    SETTINGS.symbols.canonical_symbol
+                )
+                signal = signal_engine.generate(
                     symbol=SETTINGS.symbols.canonical_symbol,
                     normalized_symbol=normalized_symbol,
                     entry_price=price,
@@ -115,31 +129,66 @@ async def run_engine() -> None:
                     sent = sender.send(signal)
                     logger.info("Signal %s sent=%s", signal.get("signal"), sent)
 
-            elif "@depth" in stream_name:
-                latest_orderbook               = parse_depth_message(data)
+            # ── ORDER BOOK ───────────────────────────────────────────────────
+            # Bybit: topic="orderbook.20.ETHUSDT"
+            # type="snapshot" → full book, type="delta" → incremental update
+            elif topic.startswith("orderbook."):
+                msg_type         = payload.get("type", "snapshot")
+                latest_orderbook = parse_depth_message(data, msg_type)
                 latest_bid_vol, latest_ask_vol = imbalance_engine.update(latest_orderbook)
 
-            elif stream_name.endswith("@kline_5m"):
-                kline = data.get("k", {})
-                if kline.get("x"):
-                    result       = trend_filter.update(kline)
-                    latest_trend = str(result["trend"])
-                    logger.info("Trend: %s slope=%.5f", latest_trend, result["slope"])
+            # ── 5M KLINE (trend) ─────────────────────────────────────────────
+            # Bybit: topic="kline.5.ETHUSDT"
+            # data = list of kline dicts: {start, end, interval, open, close,
+            #                              high, low, volume, confirm, timestamp}
+            # confirm=True means candle is closed
+            elif topic.startswith("kline.5."):
+                candles = data if isinstance(data, list) else [data]
+                for candle in candles:
+                    if candle.get("confirm"):
+                        # Reformat to match EmaTrendFilter expected keys
+                        kline = {
+                            "o": candle["open"],
+                            "c": candle["close"],
+                            "h": candle["high"],
+                            "l": candle["low"],
+                            "v": candle["volume"],
+                            "t": candle["start"],
+                            "x": True,
+                        }
+                        result       = trend_filter.update(kline)
+                        latest_trend = str(result["trend"])
+                        logger.info("Trend: %s slope=%.5f", latest_trend, result["slope"])
 
-            elif stream_name.endswith("@kline_1m"):
-                kline = data.get("k", {})
-                if kline.get("x"):
-                    latest_market_state = consolidation_filter.update(kline)["state"]
-                    bos_result          = bos_detector.update(kline)
-                    latest_bos          = bos_result["bos"]
-                    latest_swing_high   = bos_result["swing_high"]
-                    latest_swing_low    = bos_result["swing_low"]
-                    latest_1m_candle_id = int(kline.get("t", 0))
-                    signal_engine.set_candle_id(latest_1m_candle_id)
-                    logger.info("BOS: %s high=%s low=%s market=%s",
-                                latest_bos, latest_swing_high, latest_swing_low, latest_market_state)
+            # ── 1M KLINE (BOS + consolidation) ───────────────────────────────
+            elif topic.startswith("kline.1."):
+                candles = data if isinstance(data, list) else [data]
+                for candle in candles:
+                    if candle.get("confirm"):
+                        kline = {
+                            "o": candle["open"],
+                            "c": candle["close"],
+                            "h": candle["high"],
+                            "l": candle["low"],
+                            "v": candle["volume"],
+                            "t": candle["start"],
+                            "x": True,
+                        }
+                        latest_market_state = consolidation_filter.update(kline)["state"]
+                        bos_result          = bos_detector.update(kline)
+                        latest_bos          = bos_result["bos"]
+                        latest_swing_high   = bos_result["swing_high"]
+                        latest_swing_low    = bos_result["swing_low"]
+                        latest_1m_candle_id = int(candle["start"])
+                        signal_engine.set_candle_id(latest_1m_candle_id)
+                        logger.info(
+                            "BOS: %s high=%s low=%s market=%s",
+                            latest_bos, latest_swing_high,
+                            latest_swing_low, latest_market_state,
+                        )
 
             await asyncio.sleep(SETTINGS.loop_sleep_seconds)
+
     finally:
         sender.close()
 
