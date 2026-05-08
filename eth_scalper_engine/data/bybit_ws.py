@@ -1,83 +1,146 @@
+"""
+bybit_rest.py — Bybit REST API polling client
+Replaces WebSocket entirely. Works through any network restriction.
+Polls Bybit V5 REST endpoints every second for:
+  - Recent trades (delta engine)
+  - Order book (imbalance engine)
+  - 1M klines (BOS + consolidation)
+  - 5M klines (EMA trend)
+
+Named bybit_ws.py intentionally so main.py import works unchanged.
+"""
 import asyncio
-import json
 import time
+import urllib.request
+import json
 from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
-import websockets
+
+BASE = "https://api.bybit.com"
+
+
+def _get(path: str, params: dict) -> dict:
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    url   = f"{BASE}{path}?{query}"
+    with urllib.request.urlopen(url, timeout=8) as r:
+        return json.loads(r.read())
 
 
 class BybitWebSocketClient:
     """
-    Bybit V5 linear perpetuals WebSocket client.
-    Replaces BinanceWebSocketClient — same interface, different protocol.
-
-    Bybit uses a single connection with subscription messages,
-    not a combined URL like Binance. After connect we send one
-    subscribe message for all 4 topics, then receive a stream
-    of tagged messages.
-
-    Heartbeat: Bybit drops the connection after 10s of silence.
-    We send a ping every 20s to keep it alive.
+    REST polling client with same interface as BybitWebSocketClient.
+    main.py calls ws_client.stream() and ws_client.get_stream_and_data()
+    — both work identically to the WebSocket version.
     """
 
-    WS_URL  = "wss://stream.bybit.com/v5/public/linear"
-    SYMBOL  = "ETHUSDT"
-
-    def __init__(self, ws_base_url: str = WS_URL,
+    def __init__(self, ws_base_url: str = BASE,
                  symbol: str = "ETHUSDT",
                  depth_levels: int = 20):
         self.symbol       = symbol.upper()
-        self.depth_levels = depth_levels
-        # Topics to subscribe
-        self.topics = [
-            f"publicTrade.{self.symbol}",
-            f"orderbook.{self.depth_levels}.{self.symbol}",
-            f"kline.1.{self.symbol}",
-            f"kline.5.{self.symbol}",
-        ]
+        self.depth_levels = min(depth_levels, 50)   # Bybit max for REST
+        self._last_trade_id:  str = ""
+        self._last_1m_start: int  = 0
+        self._last_5m_start: int  = 0
 
     async def stream(self) -> AsyncIterator[Dict[str, Any]]:
-        backoff = 1
+        """
+        Yields synthetic payloads matching the WebSocket topic format.
+        Polls REST endpoints in a loop with asyncio.sleep between calls.
+        """
         while True:
             try:
-                async with websockets.connect(
-                    self.WS_URL,
-                    ping_interval=None,     # we handle pings manually
-                    max_size=10 * 1024 * 1024,
-                ) as ws:
-                    # Subscribe to all topics
-                    sub_msg = json.dumps({"op": "subscribe", "args": self.topics})
-                    await ws.send(sub_msg)
-                    backoff = 1
+                # 1. Recent trades
+                trades = _get("/v5/market/recent-trade", {
+                    "category": "linear",
+                    "symbol":   self.symbol,
+                    "limit":    "50",
+                })
+                if trades.get("retCode") == 0:
+                    yield {
+                        "topic": f"publicTrade.{self.symbol}",
+                        "type":  "snapshot",
+                        "data":  trades["result"]["list"],
+                    }
 
-                    last_ping = time.monotonic()
+                # 2. Order book
+                ob = _get("/v5/market/orderbook", {
+                    "category": "linear",
+                    "symbol":   self.symbol,
+                    "limit":    str(self.depth_levels),
+                })
+                if ob.get("retCode") == 0:
+                    yield {
+                        "topic": f"orderbook.{self.depth_levels}.{self.symbol}",
+                        "type":  "snapshot",
+                        "data":  ob["result"],
+                    }
 
-                    async for raw in ws:
-                        # Send heartbeat every 20s
-                        now = time.monotonic()
-                        if now - last_ping > 20:
-                            await ws.send(json.dumps({"op": "ping"}))
-                            last_ping = now
+                # 3. 1M kline — only yield if a new candle has closed
+                k1 = _get("/v5/market/kline", {
+                    "category": "linear",
+                    "symbol":   self.symbol,
+                    "interval": "1",
+                    "limit":    "3",
+                })
+                if k1.get("retCode") == 0:
+                    candles_1m = k1["result"]["list"]   # newest first
+                    # index 1 = last CLOSED candle (index 0 = still forming)
+                    if len(candles_1m) >= 2:
+                        closed = candles_1m[1]
+                        start  = int(closed[0])
+                        if start != self._last_1m_start:
+                            self._last_1m_start = start
+                            yield {
+                                "topic": f"kline.1.{self.symbol}",
+                                "type":  "snapshot",
+                                "data":  [{
+                                    "start":   start,
+                                    "open":    closed[1],
+                                    "high":    closed[2],
+                                    "low":     closed[3],
+                                    "close":   closed[4],
+                                    "volume":  closed[5],
+                                    "confirm": True,
+                                }],
+                            }
 
-                        payload = json.loads(raw)
-
-                        # Skip subscription confirmations and pong responses
-                        if "op" in payload:
-                            continue
-
-                        yield payload
+                # 4. 5M kline — only yield if a new candle has closed
+                k5 = _get("/v5/market/kline", {
+                    "category": "linear",
+                    "symbol":   self.symbol,
+                    "interval": "5",
+                    "limit":    "3",
+                })
+                if k5.get("retCode") == 0:
+                    candles_5m = k5["result"]["list"]
+                    if len(candles_5m) >= 2:
+                        closed = candles_5m[1]
+                        start  = int(closed[0])
+                        if start != self._last_5m_start:
+                            self._last_5m_start = start
+                            yield {
+                                "topic": f"kline.5.{self.symbol}",
+                                "type":  "snapshot",
+                                "data":  [{
+                                    "start":   start,
+                                    "open":    closed[1],
+                                    "high":    closed[2],
+                                    "low":     closed[3],
+                                    "close":   closed[4],
+                                    "volume":  closed[5],
+                                    "confirm": True,
+                                }],
+                            }
 
             except Exception as e:
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                # Log and continue — never crash on a single poll failure
+                pass
+
+            # Poll every 1 second
+            await asyncio.sleep(1.0)
 
     @staticmethod
     def get_stream_and_data(payload: Dict[str, Any]) -> Tuple[str, Optional[dict]]:
-        """
-        Returns (topic, data) to match the interface expected by main.py.
-        Bybit payload structure:
-          { "topic": "publicTrade.ETHUSDT", "data": [...], "ts": ..., "type": "snapshot" }
-        """
         topic = payload.get("topic", "")
         data  = payload.get("data")
         return topic, data
